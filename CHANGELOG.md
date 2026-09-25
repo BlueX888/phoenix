@@ -1,5 +1,12 @@
 # Changelog
 
+## [20.16.1](https://github.com/Arize-ai/phoenix/compare/arize-phoenix-v20.16.0...arize-phoenix-v20.16.1) (2026-09-25)
+
+
+### Documentation
+
+* **experiments:** rename run-experiments pages to fix broken cards ([#16448](https://github.com/Arize-ai/phoenix/issues/16448)) ([2577275](https://github.com/Arize-ai/phoenix/commit/2577275a938352868978e03c09355d0a3f60f847))
+
 ## [20.16.0](https://github.com/Arize-ai/phoenix/compare/arize-phoenix-v20.15.0...arize-phoenix-v20.16.0) (2026-09-23)
 
 
