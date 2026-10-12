@@ -772,13 +772,13 @@ class OpenAICompatibleClient(PlaygroundClient["AsyncOpenAI"]):
                         text_chunks.append(tc)
                         yield tc
                     if (tool_calls := delta.tool_calls) is not None:
-                        for tool_call_index, tool_call in enumerate(tool_calls):
+                        for tool_call in tool_calls:
                             tool_call_id = (
                                 tool_call.id
                                 if tool_call.id is not None
-                                else tool_call_ids[tool_call_index]
+                                else tool_call_ids.get(tool_call.index) or token_hex(4)
                             )
-                            tool_call_ids[tool_call_index] = tool_call_id
+                            tool_call_ids[tool_call.index] = tool_call_id
                             if (function := tool_call.function) is not None:
                                 tcc = ToolCallChunk(
                                     id=tool_call_id,

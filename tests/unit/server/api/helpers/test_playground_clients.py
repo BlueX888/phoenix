@@ -1,10 +1,19 @@
 import json
-from collections.abc import AsyncIterator
+from collections import defaultdict
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from openai import AsyncOpenAI, AuthenticationError
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import (
+    Choice,
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+)
 from openinference.semconv.trace import (
     MessageAttributes,
     OpenInferenceMimeTypeValues,
@@ -65,7 +74,7 @@ from phoenix.server.api.helpers.playground_registry import (
 from phoenix.server.api.input_types.GenerativeCredentialInput import GenerativeCredentialInput
 from phoenix.server.api.input_types.ModelClientOptionsInput import OpenAIApiType
 from phoenix.server.api.types.ChatCompletionMessageRole import ChatCompletionMessageRole
-from phoenix.server.api.types.ChatCompletionSubscriptionPayload import TextChunk
+from phoenix.server.api.types.ChatCompletionSubscriptionPayload import TextChunk, ToolCallChunk
 from phoenix.server.api.types.GenerativeProvider import GenerativeProviderKey
 from phoenix.server.types import DbSessionFactory
 from tests.unit.vcr import CustomVCR
@@ -89,6 +98,79 @@ def _function_tool(strict: bool = UNDEFINED) -> PromptToolFunction:
             strict=strict,
         ),
     )
+
+
+class _ReplayedChunks:
+    def __init__(self, chunks: Sequence[ChatCompletionChunk]) -> None:
+        self._chunks = iter(chunks)
+
+    def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
+        return self
+
+    async def __anext__(self) -> ChatCompletionChunk:
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class _StubAsyncOpenAI:
+    def __init__(self, chunks: Sequence[ChatCompletionChunk]) -> None:
+        self._chunks = chunks
+        self._client = None  # wrapped by _HttpxClient in _chat_completion_create
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kwargs: Any) -> _ReplayedChunks:
+        return _ReplayedChunks(self._chunks)
+
+
+def _stub_client_factory(chunks: Sequence[ChatCompletionChunk]) -> LLMClientFactory[Any]:
+    @asynccontextmanager
+    async def create_client() -> AsyncIterator[Any]:
+        yield _StubAsyncOpenAI(chunks)
+
+    return LLMClientFactory(create_client, ("openai", "test"))
+
+
+def _tool_call_chunk(tool_calls: Sequence[ChoiceDeltaToolCall]) -> ChatCompletionChunk:
+    return ChatCompletionChunk(
+        id="chatcmpl-test",
+        choices=[
+            Choice(index=0, delta=ChoiceDelta(tool_calls=list(tool_calls)), finish_reason=None)
+        ],
+        created=1_700_000_000,
+        model="gpt-4o-mini",
+        object="chat.completion.chunk",
+    )
+
+
+def _finish_chunk() -> ChatCompletionChunk:
+    return ChatCompletionChunk(
+        id="chatcmpl-test",
+        choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")],
+        created=1_700_000_000,
+        model="gpt-4o-mini",
+        object="chat.completion.chunk",
+    )
+
+
+async def _stream_tool_call_chunks(chunks: Sequence[ChatCompletionChunk]) -> list[ToolCallChunk]:
+    client = OpenAICompatibleClient(
+        client_factory=_stub_client_factory(chunks),
+        model_name="gpt-4o-mini",
+        provider="openai",
+    )
+    messages: list[PlaygroundMessage] = [
+        create_playground_message(
+            ChatCompletionMessageRole.USER,
+            "What's the weather and time in Paris?",
+        )
+    ]
+    return [
+        chunk
+        async for chunk in client.chat_completion_create(messages=messages, tools=None)
+        if isinstance(chunk, ToolCallChunk)
+    ]
 
 
 class TestGoogleStreamingClient:
@@ -516,6 +598,92 @@ class TestOpenAIBaseStreamingClient:
         assert attributes.pop(INPUT_MIME_TYPE) == JSON
 
         assert not attributes
+
+
+class TestOpenAICompatibleClientStreamingToolCalls:
+    async def test_parallel_tool_call_fragments_are_attributed_by_delta_index(self) -> None:
+        chunks = [
+            _tool_call_chunk(
+                [
+                    ChoiceDeltaToolCall(
+                        index=0,
+                        id="call_A",
+                        function=ChoiceDeltaToolCallFunction(name="get_weather", arguments=""),
+                    )
+                ]
+            ),
+            _tool_call_chunk(
+                [
+                    ChoiceDeltaToolCall(
+                        index=1,
+                        id="call_B",
+                        function=ChoiceDeltaToolCallFunction(name="get_time", arguments=""),
+                    )
+                ]
+            ),
+            _tool_call_chunk(
+                [
+                    ChoiceDeltaToolCall(
+                        index=0,
+                        function=ChoiceDeltaToolCallFunction(arguments='{"city": "Paris"}'),
+                    )
+                ]
+            ),
+            _tool_call_chunk(
+                [
+                    ChoiceDeltaToolCall(
+                        index=1,
+                        function=ChoiceDeltaToolCallFunction(arguments='{"tz": "CET"}'),
+                    )
+                ]
+            ),
+            _finish_chunk(),
+        ]
+        tool_call_chunks = await _stream_tool_call_chunks(chunks)
+        assert [
+            (chunk.id, chunk.function.name, chunk.function.arguments) for chunk in tool_call_chunks
+        ] == [
+            ("call_A", "get_weather", ""),
+            ("call_B", "get_time", ""),
+            ("call_A", "", '{"city": "Paris"}'),
+            ("call_B", "", '{"tz": "CET"}'),
+        ]
+        # Reassemble the way the frontend and the span do: merge by id.
+        merged: defaultdict[str, list[str]] = defaultdict(list)
+        for chunk in tool_call_chunks:
+            merged[chunk.id].append(chunk.function.arguments)
+        assert json.loads("".join(merged["call_A"])) == {"city": "Paris"}
+        assert json.loads("".join(merged["call_B"])) == {"tz": "CET"}
+
+    async def test_tool_call_fragments_without_id_share_a_stable_id(self) -> None:
+        chunks = [
+            _tool_call_chunk(
+                [
+                    ChoiceDeltaToolCall(
+                        index=0,
+                        function=ChoiceDeltaToolCallFunction(
+                            name="get_weather", arguments='{"city": '
+                        ),
+                    )
+                ]
+            ),
+            _tool_call_chunk(
+                [
+                    ChoiceDeltaToolCall(
+                        index=0,
+                        function=ChoiceDeltaToolCallFunction(arguments='"Paris"}'),
+                    )
+                ]
+            ),
+            _finish_chunk(),
+        ]
+        tool_call_chunks = await _stream_tool_call_chunks(chunks)
+        assert len(tool_call_chunks) == 2
+        assert tool_call_chunks[0].id == tool_call_chunks[1].id
+        assert tool_call_chunks[0].function.name == "get_weather"
+        assert json.loads("".join(chunk.function.arguments for chunk in tool_call_chunks)) == {
+            "city": "Paris"
+        }
 
 
 class TestAnthropicStreamingClient:
